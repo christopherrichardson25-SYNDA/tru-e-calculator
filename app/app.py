@@ -1,20 +1,18 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, conlist
+from pydantic import BaseModel, Field, conlist, EmailStr
 from typing import Optional, Dict, List
-import math
+import os
+import httpx
 
 app = FastAPI(title="TRU-e Calculator", version="0.2.1")
 
-ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://localhost:3001",
-    # "https://tu-dashboard.vercel.app",
-    # "https://<tu-codespace>.app.github.dev",
-]
+# -------------------- CORS --------------------
+# Permite localhost, 127.0.0.1, *.app.github.dev (Codespaces) y *.vercel.app
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"^https?:\/\/([a-z0-9-]+-)?(localhost(:\d+)?|127\.0\.0\.1(:\d+)?|.*\.app\.github\.dev|.*\.vercel\.app)$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -273,7 +271,7 @@ def compute_one(industry: str, brand: str, inp: Inputs, w_override: Optional[Dic
     )
 
 # ===================== ENDPOINTS =====================
-@app.get("/health")
+@app.get("/health", tags=["meta"])
 def health():
     return {"ok": True, "service": "tru-e-calculator", "version": "0.2.1"}
 
@@ -286,10 +284,47 @@ def score_batch(payload: ScoreBatchRequest):
     results = [compute_one(payload.industry, b.brand, b.data, payload.weights_override) for b in payload.brands]
     return ScoreBatchResponse(industry=payload.industry, results=results)
 
-@app.get("/health")
-def _health():
-    return {"ok": True}
-
-@app.get("/")
+@app.get("/", tags=["meta"])
 def _root():
     return {"ok": True, "docs": "/docs", "health": "/health"}
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return Response(status_code=204)
+
+# ===================== /lead → Supabase =====================
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_ROLE = os.getenv("SUPABASE_SERVICE_ROLE", "")
+LEADS_TABLE = "leads"
+
+class LeadIn(BaseModel):
+    email: EmailStr
+    brand: str
+    industry: str
+    snapshot: dict
+    source: Optional[str] = "quick-check"
+
+@app.post("/lead")
+async def lead(payload: LeadIn):
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE:
+        raise HTTPException(status_code=500, detail="Supabase credentials missing")
+
+    url = f"{SUPABASE_URL}/rest/v1/{LEADS_TABLE}"
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(url, headers=headers, json=payload.dict(), params={"select": "*"})
+        if r.status_code >= 400:
+            try:
+                detail = r.json()
+            except Exception:
+                detail = r.text
+            raise HTTPException(status_code=r.status_code, detail={"supabase_error": detail})
+
+    return r.json()
+
